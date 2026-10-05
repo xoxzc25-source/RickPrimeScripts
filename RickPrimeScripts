@@ -4508,7 +4508,11 @@ end
 
 end -- конец блока двойника
 --=====================================================================
--- ДРОН v11 — полёт CFrame (подкинуть физически невозможно), 20..200
+-- ДРОН v11.4 — ТЫ СТОИШЬ НА ДРОНЕ
+--  * НИКАКИХ Sit / SetStateEnabled(false) — прыжок всегда работает
+--  * Полёт: LinearVelocity + AlignOrientation (реплицируется всем)
+--  * Слезание: R | K (авария) | ⤓ на паде | ВЫЛЕЗТИ — всё через
+--    ensurePlayerFree(): чистка ВСЕХ констрейнтов на теле + все стейты ON
 --=====================================================================
 do
 local WHITE  = Color3.fromRGB(240, 243, 247)
@@ -4521,7 +4525,9 @@ local CYAN   = Color3.fromRGB(90, 220, 235)
 local ORBIT_R, ORBIT_H, ORBIT_SPEED = 6, 3.2, 0.8
 local FLIGHT_MIN, FLIGHT_MAX, FLIGHT_STEP = 20, 200, 20
 local MOUNT_CD = 0.5
-local COCKPIT_OFFSET = CFrame.new(0, 1.0, 0.1)
+-- дрон под НОГАМИ стоящего персонажа (подгони -2.7, если сидит высоко/низко)
+local STAND_OFFSET  = CFrame.new(0, 2.7, 0)
+local DRONE_FOLLOW  = CFrame.new(0, -2.7, 0)
 local droneSpeed = 60
 
 droneOwned = false
@@ -4533,7 +4539,9 @@ local droneConn = nil
 local droneRiderNoCols = {}
 local droneRiderHum = nil
 local droneRiderChar = nil
-local riderStatesLocked = false
+local riderAtt, riderLV, riderAO = nil, nil, nil
+local riderDiedConn = nil
+local dismounting = false
 local droneState = "ORBIT"
 local droneTarget = nil
 local droneFlT = 0
@@ -4543,6 +4551,40 @@ local mountCdUntil = 0
 
 local flyHud = nil
 local speedLabel = nil
+
+----------------------------------------------------------------------
+-- ENSURE PLAYER FREE: ядерная кнопка против залипания.
+-- Уничтожает ВСЕ драйверы движения на теле, включает ВСЕ стейты,
+-- снимает якоря. Вызывается при слезании/спавне двойника/респавне.
+----------------------------------------------------------------------
+local function ensurePlayerFree()
+    local char = LocalPlayer.Character
+    local hrp = char and char:FindFirstChild("HumanoidRootPart")
+    local hum = char and char:FindFirstChildOfClass("Humanoid")
+    if hrp and hrp.Parent then
+        for _, d in ipairs(hrp:GetChildren()) do
+            if d:IsA("BodyVelocity") or d:IsA("BodyPosition") or d:IsA("BodyGyro")
+                or d:IsA("BodyForce") or d:IsA("VectorForce")
+                or d:IsA("LinearVelocity") or d:IsA("AlignOrientation")
+                or d:IsA("AlignPosition") then
+                pcall(function() d:Destroy() end)
+            end
+        end
+        if hrp.Anchored then hrp.Anchored = false end
+    end
+    if hum and hum.Parent then
+        pcall(function()
+            hum:SetStateEnabled(Enum.HumanoidStateType.Jumping, true)
+            hum:SetStateEnabled(Enum.HumanoidStateType.GettingUp, true)
+            hum:SetStateEnabled(Enum.HumanoidStateType.Seated, true)
+            hum:SetStateEnabled(Enum.HumanoidStateType.Freefall, true)
+            hum.AutoRotate = true
+            hum.PlatformStand = false
+            hum.Sit = false
+        end)
+    end
+end
+_G.__npPlayerFree = ensurePlayerFree
 
 local function refreshSpeed()
     if speedLabel and speedLabel.Parent then
@@ -4624,8 +4666,8 @@ local function buildFlyHud()
     plus.MouseButton1Click:Connect(speedUp)
 
     local out = mkBtn("ВЫЛЕЗТИ", UDim2.fromOffset(118, 38), UDim2.new(1, -126, 0.5, -19), COLOR_PRIME_RED)
-    out.MouseButton1Click:Connect(function()
-        droneMountToggle()
+    out.Activated:Connect(function()
+        if _G.__npDroneDismount then _G.__npDroneDismount("ДРОН: СЛЕЗ // ВОЗВРАТ НА ОРБИТУ") end
     end)
 
     if UserInputService.TouchEnabled then
@@ -4673,6 +4715,27 @@ local function buildFlyHud()
         holdBtn("▶", UDim2.fromOffset(124, 62), Enum.KeyCode.D)
         holdBtn("⬆", UDim2.fromOffset(210, 0),   Enum.KeyCode.Space)
         holdBtn("⬇", UDim2.fromOffset(210, 124), Enum.KeyCode.LeftShift)
+
+        local dis = Instance.new("TextButton")
+        dis.Size = UDim2.fromOffset(56, 56)
+        dis.Position = UDim2.fromOffset(210, 62)
+        dis.BackgroundColor3 = COLOR_BG
+        dis.BackgroundTransparency = 0.25
+        dis.Text = "⤓"
+        dis.TextColor3 = COLOR_PRIME_RED
+        dis.Font = Enum.Font.Code
+        dis.TextSize = 22
+        dis.AutoButtonColor = false
+        dis.Parent = pad
+        do
+            local c = Instance.new("UICorner"); c.CornerRadius = UDim.new(1, 0); c.Parent = dis
+        end
+        do
+            local st = Instance.new("UIStroke"); st.Color, st.Thickness, st.Transparency = COLOR_PRIME_RED, 1.4, 0.3; st.Parent = dis
+        end
+        dis.Activated:Connect(function()
+            if _G.__npDroneDismount then _G.__npDroneDismount("ДРОН: СЛЕЗ // ВОЗВРАТ НА ОРБИТУ") end
+        end)
     end
 end
 
@@ -4686,6 +4749,65 @@ local function eyeColor(red)
         pcall(function() TweenService:Create(droneEyeLight, TweenInfo.new(0.15), {Color = c, Brightness = red and 6 or 3}):Play() end)
     end
 end
+
+----------------------------------------------------------------------
+-- СЛЕЗАНИЕ: чистит ВСЁ безусловно. Ни одного флага-пропуска.
+----------------------------------------------------------------------
+local function forceDismount(reason)
+    if dismounting then return end
+    dismounting = true
+
+    if riderDiedConn then pcall(function() riderDiedConn:Disconnect() end) riderDiedConn = nil end
+
+    if riderLV then pcall(function() riderLV:Destroy() end) riderLV = nil end
+    if riderAO then pcall(function() riderAO:Destroy() end) riderAO = nil end
+    if riderAtt then pcall(function() riderAtt:Destroy() end) riderAtt = nil end
+
+    -- полная чистка тела: стейты, якоря, чужие констрейнты
+    ensurePlayerFree()
+
+    local char = droneRiderChar
+    if char and char.Parent then
+        local r = char:FindFirstChild("HumanoidRootPart")
+        if r and r.Parent then
+            r.AssemblyLinearVelocity = Vector3.new(0, 6, 0)
+            r.AssemblyAngularVelocity = Vector3.zero
+        end
+    end
+
+    for _, nc in ipairs(droneRiderNoCols) do
+        pcall(function() nc:Destroy() end)
+    end
+    droneRiderNoCols = {}
+    droneRiderHum = nil
+    droneRiderChar = nil
+
+    if droneCore and droneCore.Parent then
+        droneCore.Anchored = true
+    end
+    flyVel = Vector3.zero
+    droneState = "ORBIT"
+    eyeColor(false)
+    _G.__npDroneMounted = false
+    if _G.__npVKey then
+        for k in pairs(_G.__npVKey) do _G.__npVKey[k] = false end
+    end
+    if flyHud then flyHud.Enabled = false end
+
+    task.delay(0.15, function() dismounting = false end)
+    if reason then setStatus(reason) end
+end
+_G.__npDroneDismount = forceDismount
+
+-- ГЛОБАЛЬНЫЙ R: один коннект на всё время скрипта
+UserInputService.InputBegan:Connect(function(input, gp)
+    if gp then return end
+    if input.KeyCode == Enum.KeyCode.R then
+        if _G.__npDroneMounted and _G.__npDroneDismount then
+            _G.__npDroneDismount("ДРОН: СЛЕЗ // ВОЗВРАТ НА ОРБИТУ")
+        end
+    end
+end)
 
 local function buildModel()
     local m = Instance.new("Model")
@@ -4796,49 +4918,10 @@ local function buildModel()
     return m
 end
 
-local function cleanupRider()
-    if droneRiderHum and droneRiderHum.Parent then
-        pcall(function()
-            if riderStatesLocked then
-                droneRiderHum:SetStateEnabled(Enum.HumanoidStateType.Jumping, true)
-                droneRiderHum:SetStateEnabled(Enum.HumanoidStateType.GettingUp, true)
-            end
-            riderStatesLocked = false
-            droneRiderHum.AutoRotate = true
-            droneRiderHum.Sit = false
-            droneRiderHum:ChangeState(Enum.HumanoidStateType.GettingUp)
-        end)
-    end
-    if droneRiderChar then
-        local r = droneRiderChar:FindFirstChild("HumanoidRootPart")
-        if r and r.Parent then
-            r.Anchored = false
-            r.AssemblyLinearVelocity = Vector3.new(0, 8, 0)
-        end
-    end
-    for _, nc in ipairs(droneRiderNoCols) do
-        pcall(function() nc:Destroy() end)
-    end
-    droneRiderNoCols = {}
-    droneRiderHum = nil
-    droneRiderChar = nil
-    if droneCore and droneCore.Parent then
-        droneCore.Anchored = true
-    end
-    flyVel = Vector3.zero
-    droneState = "ORBIT"
-    eyeColor(false)
-    _G.__npDroneMounted = false
-    if _G.__npVKey then
-        for k in pairs(_G.__npVKey) do _G.__npVKey[k] = false end
-    end
-    if flyHud then flyHud.Enabled = false end
-end
-
 function removeDrone()
     droneOwned = false
     if droneConn then pcall(function() droneConn:Disconnect() end); droneConn = nil end
-    cleanupRider()
+    forceDismount()
     if droneModel and droneModel.Parent then
         pcall(function() droneModel:Destroy() end)
     end
@@ -4891,23 +4974,21 @@ function giveDrone()
         local root = char and char:FindFirstChild("HumanoidRootPart")
         local hum = char and char:FindFirstChildOfClass("Humanoid")
 
-        ---------------- ПОЛЁТ ----------------
+        ---------------- ПОЛЁТ (СТОЯ НА ДРОНЕ) ----------------
         if droneRiderHum then
             if not (root and hum and hum.Health > 0) or droneRiderChar ~= char then
-                cleanupRider()
-                setStatus("ДРОН: РАЗВАР // ВОЗВРАТ НА ОРБИТУ")
+                forceDismount("ДРОН: РАЗВАР // ВОЗВРАТ НА ОРБИТУ")
                 return
             end
             if not droneCore.Anchored then droneCore.Anchored = true end
-            if not root.Anchored then root.Anchored = true end
+            -- СТЕЙТЫ НЕ ТРОГАЕМ: прыжок/бег всегда живы
 
             local typing = UserInputService:GetFocusedTextBox() ~= nil
             local function key(kc)
                 return (not typing) and (UserInputService:IsKeyDown(kc) or (_G.__npVKey and _G.__npVKey[kc] == true))
             end
             if key(Enum.KeyCode.R) then
-                cleanupRider()
-                setStatus("ДРОН: СЛЕЗ // ВОЗВРАТ НА ОРБИТУ")
+                forceDismount("ДРОН: СЛЕЗ // ВОЗВРАТ НА ОРБИТУ")
                 return
             end
 
@@ -4922,34 +5003,33 @@ function giveDrone()
             if key(Enum.KeyCode.LeftShift) then move -= Vector3.yAxis end
 
             local targetVel = (move.Magnitude > 0.05) and (move.Unit * droneSpeed) or Vector3.zero
+            -- когда ничего не жмёшь: мягкое зависание (гравитацию гасим сами)
+            if move.Magnitude <= 0.05 then
+                targetVel = Vector3.new(0, 2, 0)
+            end
             flyVel = flyVel:Lerp(targetVel, 1 - math.exp(-dt * 6))
 
-            local disp = flyVel * dt
-            local newPos = droneCore.Position
-            if disp.Magnitude > 0.001 then
+            if flyVel.Magnitude > 1 then
                 local rp = RaycastParams.new()
                 rp.FilterType = Enum.RaycastFilterType.Exclude
                 rp.FilterDescendantsInstances = {droneModel, char}
-                local hit = workspace:Raycast(droneCore.Position, disp, rp)
+                local hit = workspace:Raycast(root.Position, flyVel.Unit * (flyVel.Magnitude * dt + 2.2), rp)
                 if hit then
-                    newPos = hit.Position - hit.Normal * 1.4
-                    flyVel = Vector3.zero
-                else
-                    newPos = droneCore.Position + disp
+                    local n = hit.Normal
+                    local into = flyVel:Dot(n)
+                    if into < 0 then
+                        flyVel = flyVel - n * into
+                    end
                 end
             end
 
-            local rp2 = RaycastParams.new()
-            rp2.FilterType = Enum.RaycastFilterType.Exclude
-            rp2.FilterDescendantsInstances = {droneModel, char}
-            local g = workspace:Raycast(newPos, Vector3.new(0, -3.4, 0), rp2)
-            if g and (newPos.Y - g.Position.Y) < 2.4 then
-                newPos = Vector3.new(newPos.X, g.Position.Y + 2.4, newPos.Z)
-                if flyVel.Y < 0 then flyVel = Vector3.new(flyVel.X, 0, flyVel.Z) end
-            end
             local fh = workspace.FallenPartsDestroyHeight
-            if fh == fh and newPos.Y < fh + 6 then
-                newPos = Vector3.new(newPos.X, fh + 6, newPos.Z)
+            if fh == fh and root.Position.Y < fh + 6 and flyVel.Y < 0 then
+                flyVel = Vector3.new(flyVel.X, 0, flyVel.Z)
+            end
+
+            if riderLV and riderLV.Parent then
+                riderLV.VectorVelocity = flyVel
             end
 
             local look = camCF.LookVector
@@ -4957,21 +5037,17 @@ function giveDrone()
             if flat.Magnitude < 0.05 then flat = Vector3.new(0, 0, -1) end
             flat = flat.Unit
             local pitch, roll = 0, 0
-            if move.Magnitude > 0.05 then
-                pitch = math.clamp(-look.Y * 0.4, -0.5, 0.5)
-                roll = math.clamp(-move.Unit:Dot(camCF.RightVector) * 0.18, -0.3, 0.3)
+            if move.Magnitude > 0.05 and move.Y == 0 then
+                pitch = math.clamp(-look.Y * 0.3, -0.4, 0.4)
+                roll = math.clamp(-move.Unit:Dot(camCF.RightVector) * 0.12, -0.2, 0.2)
             end
-            local bob = (move.Magnitude <= 0.05) and math.sin(droneT * 2) * 0.08 or 0
-
-            local newCF = CFrame.new(newPos + Vector3.new(0, bob, 0))
-                * CFrame.lookAt(Vector3.zero, flat)
-                * CFrame.Angles(pitch, 0, roll)
-            droneCore.CFrame = newCF
-            root.CFrame = newCF * COCKPIT_OFFSET
-
-            if hum:GetState() ~= Enum.HumanoidStateType.Seated then
-                pcall(function() hum.Sit = true end)
+            if riderAO and riderAO.Parent then
+                riderAO.CFrame = CFrame.lookAt(Vector3.zero, flat) * CFrame.Angles(pitch, 0, roll)
             end
+
+            -- дрон ПОД НОГАМИ стоящего персонажа
+            local bob = (move.Magnitude <= 0.05) and math.sin(droneT * 2) * 0.06 or 0
+            droneCore.CFrame = (root.CFrame * DRONE_FOLLOW) + Vector3.new(0, bob, 0)
             return
         end
 
@@ -5046,7 +5122,7 @@ function giveDrone()
     end)
 
     if droneButtonRefresh then droneButtonRefresh() end
-    setStatus("ДРОН ВЫЗВАН // СЕСТЬ — КНОПКА В МЕНЮ")
+    setStatus("ДРОН ВЫЗВАН // ВСТАТЬ НА НЕГО — КНОПКА В МЕНЮ")
 end
 
 droneMountToggle = function()
@@ -5056,8 +5132,7 @@ droneMountToggle = function()
     end
 
     if droneRiderHum then
-        cleanupRider()
-        setStatus("ДРОН: СЛЕЗ // ВОЗВРАТ НА ОРБИТУ")
+        forceDismount("ДРОН: СЛЕЗ // ВОЗВРАТ НА ОРБИТУ")
         return
     end
 
@@ -5085,7 +5160,8 @@ droneMountToggle = function()
     local dPos = hrp.Position + hrp.CFrame.RightVector * 2.2 + Vector3.new(0, 0.3, 0)
     droneCore.CFrame = CFrame.lookAt(dPos, dPos + flatLook)
 
-    hrp.CFrame = droneCore.CFrame * COCKPIT_OFFSET
+    -- ставим игрока СТОЯ на дрон
+    hrp.CFrame = droneCore.CFrame * STAND_OFFSET
 
     for _, bp in ipairs(char:GetDescendants()) do
         if bp:IsA("BasePart") then
@@ -5108,17 +5184,47 @@ droneMountToggle = function()
         end
     end
 
-    hrp.Anchored = true
+    -- ТЕЛО НЕ АНКОРИМ И СТЕЙТЫ НЕ ВЫКЛЮЧАЕМ. ВООБЩЕ.
+    hrp.Anchored = false
+
     droneRiderHum = hum
     droneRiderChar = char
     droneCore.Anchored = true
 
     pcall(function()
-        hum.AutoRotate = false
-        hum:SetStateEnabled(Enum.HumanoidStateType.Jumping, false)
-        hum:SetStateEnabled(Enum.HumanoidStateType.GettingUp, false)
-        riderStatesLocked = true
-        hum.Sit = true
+        hum.AutoRotate = false -- ориентацией управляет AlignOrientation, вернём при слезании
+        hum.Sit = false        -- СТОИМ, не сидим
+    end)
+
+    if riderDiedConn then pcall(function() riderDiedConn:Disconnect() end) end
+    riderDiedConn = hum.Died:Connect(function()
+        task.wait(0.05)
+        forceDismount("ДРОН: РАЗВАР // ТЫ УМЕР")
+    end)
+
+    pcall(function()
+        riderAtt = Instance.new("Attachment")
+        riderAtt.Name = "PrimeDroneRiderAtt"
+        riderAtt.Parent = hrp
+
+        riderLV = Instance.new("LinearVelocity")
+        riderLV.Name = "PrimeDroneLV"
+        riderLV.Attachment0 = riderAtt
+        riderLV.MaxForce = math.huge
+        riderLV.VelocityConstraintMode = Enum.VelocityConstraintMode.Vector
+        riderLV.RelativeTo = Enum.ActuatorRelativeTo.World
+        riderLV.VectorVelocity = Vector3.zero
+        riderLV.Parent = hrp
+
+        riderAO = Instance.new("AlignOrientation")
+        riderAO.Name = "PrimeDroneAO"
+        riderAO.Mode = Enum.OrientationAlignmentMode.OneAttachment
+        riderAO.Attachment0 = riderAtt
+        riderAO.MaxTorque = math.huge
+        riderAO.Responsiveness = 30
+        riderAO.RigidityEnabled = true
+        riderAO.CFrame = hrp.CFrame - hrp.CFrame.Position
+        riderAO.Parent = hrp
     end)
 
     flyVel = Vector3.zero
@@ -5132,10 +5238,559 @@ droneMountToggle = function()
 
     playSoundAt(droneCore, CONFIG.HoloDodgeSoundId, 1, 1.1, false)
     fxFlash(droneCore.Position, 0.5, 3, Color3.fromRGB(210, 248, 255), 0.3, 4, 10)
-    setStatus("ДРОН: ТЫ В КАБИНЕ // ЛЕТИ КУДА СМОТРИШЬ, E/X СКОРОСТЬ, ВЫЛЕЗТИ — КНОПКА HUD")
+    setStatus("ДРОН: ТЫ СТОИШЬ НА НЕГО // СЛЕЗЬ: R | K | ⤓ | ВЫЛЕЗТИ")
 end
 
 end -- конец блока дрона
+
+--=====================================================================
+-- ДВОЙНИК v4.5 — переопределяет версию из Части 2.
+--  * ПЕРЕД спавном: _G.__npPlayerFree() — чистит тело, прыжок жив
+--  * Твоё тело за спиной жертвы видно ВСЕМ (скорость = скорости жертвы)
+--  * Клон-модель — локальный визуал (ограничение Roblox для LocalScript)
+--=====================================================================
+do
+local DOUBLE_SPEED = 31
+local doubleSession = 0
+local doubleState = "IDLE"
+local doubleVictim = nil
+local cloneModel, cloneRoot, cloneHum = nil, nil, nil
+local cloneConn, chokeConn, cloneDiedConn = nil, nil, nil
+local walkTrack = nil
+local savedMyCF = nil
+
+local TRASH_NAMES = {
+    NanoShatterPieces = true, PrimeDouble = true, NanoSeveredHead = true,
+    PrimeDoubleSpawn = true, PrimeBombBody = true, PrimeCrater = true, RickPrimeDrone = true,
+}
+
+local function groundFilter(extra)
+    local list = extra or {}
+    for _, pl in ipairs(Players:GetPlayers()) do
+        if pl.Character then table.insert(list, pl.Character) end
+    end
+    for _, d in ipairs(workspace:GetChildren()) do
+        if isFx(d) or TRASH_NAMES[d.Name] then table.insert(list, d) end
+    end
+    if cloneModel then table.insert(list, cloneModel) end
+    return list
+end
+
+local function groundAt(pos)
+    local rp = RaycastParams.new()
+    rp.FilterType = Enum.RaycastFilterType.Exclude
+    rp.FilterDescendantsInstances = groundFilter(nil)
+    local res = workspace:Raycast(pos + Vector3.new(0, 30, 0), Vector3.new(0, -160, 0), rp)
+    if res then return res.Position end
+    return pos
+end
+
+local function measureRigOffset(model, rootPart, hum)
+    if not (model and rootPart and rootPart.Parent) then
+        if hum then
+            if hum.RigType == Enum.HumanoidRigType.R6 then return 3 end
+            return (hum.HipHeight or 2) + rootPart.Size.Y / 2
+        end
+        return 2.8
+    end
+    for _, d in ipairs(model:GetDescendants()) do
+        if d:IsA("Motor6D") then pcall(function() d.Transform = CFrame.new() end) end
+    end
+    RunService.Heartbeat:Wait()
+    local lowest
+    for _, d in ipairs(model:GetDescendants()) do
+        if d:IsA("BasePart") and d ~= rootPart then
+            local b = d.Position.Y - d.Size.Y / 2
+            if not lowest or b < lowest then lowest = b end
+        end
+    end
+    if lowest then
+        return math.clamp(rootPart.Position.Y - lowest, 1.2, 5.2)
+    end
+    if hum then
+        if hum.RigType == Enum.HumanoidRigType.R6 then return 3 end
+        return (hum.HipHeight or 2) + rootPart.Size.Y / 2
+    end
+    return 2.8
+end
+
+local function stopWalkAnim()
+    if walkTrack then pcall(function() walkTrack:Stop(0.15) end) end
+end
+local function playWalkAnim()
+    if walkTrack and not walkTrack.IsPlaying then pcall(function() walkTrack:Play(0.15) end) end
+end
+
+local function cleanupClone(fade)
+    if cloneConn then cloneConn:Disconnect(); cloneConn = nil end
+    if chokeConn then chokeConn:Disconnect(); chokeConn = nil end
+    if cloneDiedConn then cloneDiedConn:Disconnect(); cloneDiedConn = nil end
+    stopWalkAnim()
+    walkTrack = nil
+    if cloneModel then
+        local m = cloneModel
+        cloneModel, cloneRoot, cloneHum = nil, nil, nil
+        if m.Parent then
+            if fade then
+                for _, d in ipairs(m:GetDescendants()) do
+                    if d:IsA("BasePart") then
+                        TweenService:Create(d, TweenInfo.new(0.35), {Transparency = 1}):Play()
+                    end
+                end
+                Debris:AddItem(m, 0.45)
+            else
+                m:Destroy()
+            end
+        end
+    end
+end
+
+local function endDoubleSession(statusText)
+    doubleSession += 1
+    doubleState = "IDLE"
+    doubleVictim = nil
+    savedMyCF = nil
+    cleanupClone(true)
+    if statusText then setStatus(statusText) end
+end
+
+local function buildDoubleClone(char)
+    local wasArch = char.Archivable
+    char.Archivable = true
+    local copy = char:Clone()
+    char.Archivable = wasArch
+    if not copy then
+        copy = Instance.new("Model")
+        local b = newFxPart("PrimeDoubleCore", Vector3.new(1.4, 1.4, 1.4), CONFIG.BotColor, Enum.Material.Neon, 0.3, nil)
+        b.Anchored = true
+        b.Parent = copy
+        copy.PrimaryPart = b
+        return copy, b
+    end
+    copy.Name = "PrimeDouble"
+    for _, d in ipairs(copy:GetDescendants()) do
+        if d:IsA("LuaSourceContainer") or d:IsA("Tool") or d:IsA("Highlight")
+            or d:IsA("Sound") or d:IsA("ParticleEmitter") or d:IsA("Beam") or d:IsA("Trail")
+            or d:IsA("Light") or d:GetAttribute("NPExclude") or isFx(d) then
+            d:Destroy()
+        elseif d:IsA("BasePart") then
+            d.Anchored = false
+            d.Massless = false
+            d.CastShadow = false
+            d.CanTouch = false
+            d.CanQuery = false
+            if d.Transparency >= 0.99 then d.Transparency = 0 end
+            rawLTM(d, 0)
+        elseif d:IsA("Decal") then
+            rawLTM(d, 0)
+        end
+    end
+    local hum = copy:FindFirstChildOfClass("Humanoid")
+    local rootPart = copy.PrimaryPart or copy:FindFirstChild("HumanoidRootPart") or copy:FindFirstChildWhichIsA("BasePart")
+    copy.PrimaryPart = rootPart
+    if rootPart then rootPart.CanCollide = false end
+
+    if hum then
+        hum.DisplayDistanceType = Enum.HumanoidDisplayDistanceType.None
+        hum.HealthDisplayType = Enum.HumanoidHealthDisplayType.AlwaysOff
+        hum.RequiresNeck = false
+        hum.BreakJointsOnDeath = false
+        hum.PlatformStand = false
+        hum.AutoRotate = true
+        hum.WalkSpeed = DOUBLE_SPEED
+    end
+
+    if groupsUsable then
+        for _, d in ipairs(copy:GetDescendants()) do
+            if d:IsA("BasePart") then setPartGroup(d, DOUBLE_GROUP) end
+        end
+    else
+        local myPos = char:GetPivot().Position
+        for _, pl in ipairs(Players:GetPlayers()) do
+            if pl ~= LocalPlayer and pl.Character then
+                local chPos = pl.Character:GetPivot().Position
+                if (chPos - myPos).Magnitude < 60 then
+                    for _, bp in ipairs(pl.Character:GetChildren()) do
+                        if bp:IsA("BasePart")
+                            and (bp.Name == "HumanoidRootPart" or bp.Name == "Head" or bp.Name == "Torso" or bp.Name == "UpperTorso") then
+                            local nc = Instance.new("NoCollisionConstraint")
+                            nc.Part0 = (rootPart or copy:FindFirstChildWhichIsA("BasePart"))
+                            nc.Part1 = bp
+                            nc.Parent = copy
+                        end
+                    end
+                end
+            end
+        end
+    end
+
+    local hl = Instance.new("Highlight")
+    hl.FillColor = CONFIG.BotColor
+    hl.FillTransparency = 0.55
+    hl.OutlineColor = Color3.fromRGB(190, 240, 255)
+    hl.OutlineTransparency = 0.1
+    hl.DepthMode = Enum.HighlightDepthMode.AlwaysOnTop
+    hl.Parent = copy
+    return copy, rootPart
+end
+
+local function loadWalkAnim()
+    if walkTrack or not cloneHum or not cloneRoot then return end
+    local animator = cloneHum:FindFirstChildOfClass("Animator")
+    if not animator then
+        animator = Instance.new("Animator")
+        animator.Parent = cloneHum
+    end
+    local animId = (cloneHum.RigType == Enum.HumanoidRigType.R6) and "rbxassetid://180426354" or "rbxassetid://507767714"
+    local anim = Instance.new("Animation")
+    anim.AnimationId = animId
+    local ok, track2 = pcall(function() return animator:LoadAnimation(anim) end)
+    if ok and track2 then
+        track2.Looped = true
+        track2.Priority = Enum.AnimationPriority.Movement
+        walkTrack = track2
+    end
+end
+
+local function materializeClone(rootPart, hum, groundPos, rigOff, onReady)
+    local parts = {}
+    for _, d in ipairs(cloneModel:GetDescendants()) do
+        if d:IsA("BasePart") then
+            d.Transparency = 1
+            table.insert(parts, d)
+        end
+    end
+
+    local host = Instance.new("Part")
+    host.Name = "PrimeDoubleSpawn"
+    host.Anchored, host.Transparency = true, 1
+    host.Size = Vector3.new(0.2, 0.2, 0.2)
+    host.CanCollide, host.CanTouch, host.CanQuery = false, false, false
+    host.CastShadow = false
+    host.CFrame = CFrame.new(groundPos + Vector3.new(0, 0.3, 0))
+    host.Parent = workspace
+    local pe = Instance.new("ParticleEmitter")
+    pe.Color = ColorSequence.new(CONFIG.BotColor, Color3.fromRGB(210, 248, 255))
+    pe.LightEmission = 1
+    pe.Size = NumberSequence.new({NumberSequenceKeypoint.new(0, 0.22), NumberSequenceKeypoint.new(1, 0)})
+    pe.Lifetime = NumberRange.new(0.4, 0.8)
+    pe.Speed = NumberRange.new(4, 9)
+    pe.SpreadAngle = Vector2.new(18, 18)
+    pe.Acceleration = Vector3.new(0, 10, 0)
+    pe.Rate = 0
+    pe.Parent = host
+    pe:Emit(45)
+    Debris:AddItem(host, 1.4)
+
+    local keep = rootPart.CFrame - rootPart.CFrame.Position
+    local startCF = CFrame.new(groundPos - Vector3.new(0, 2.4, 0)) * keep
+    local endCF = CFrame.new(groundPos + Vector3.new(0, rigOff, 0)) * keep
+    rootPart.Anchored = true
+    rootPart.CFrame = startCF
+
+    fxFlash(groundPos + Vector3.new(0, 1.5, 0), 0.8, 6, Color3.fromRGB(210, 248, 255), 0.45, 6, 16)
+    playSoundAt(rootPart, CONFIG.HoloDodgeSoundId, 0.9, 0.85, false)
+
+    task.spawn(function()
+        for _, p in ipairs(parts) do
+            TweenService:Create(p, TweenInfo.new(0.7), {Transparency = 0.3}):Play()
+        end
+        TweenService:Create(rootPart, TweenInfo.new(0.7, Enum.EasingStyle.Sine, Enum.EasingDirection.Out),
+            {CFrame = endCF}):Play()
+        task.wait(0.75)
+        for _, p in ipairs(parts) do
+            if p.Parent then
+                TweenService:Create(p, TweenInfo.new(0.25), {Transparency = 0}):Play()
+            end
+        end
+        fxFlash(groundPos + Vector3.new(0, 2, 0), 0.5, 3.5, Color3.fromRGB(210, 248, 255), 0.25, 4, 10)
+        task.wait(0.25)
+        if rootPart.Parent then
+            rootPart.Anchored = false
+            pcall(function() hum:ChangeState(Enum.HumanoidStateType.GettingUp) end)
+        end
+        if onReady then onReady() end
+    end)
+end
+
+local function doubleWave(originPos)
+    local ground = groundAt(originPos)
+    local rot = CFrame.Angles(0, 0, math.rad(90))
+    for i = 1, 3 do
+        task.delay((i - 1) * 0.07, function()
+            local ring = Instance.new("Part")
+            ring.Name = "PrimeDoubleWave"
+            ring.Shape = Enum.PartType.Cylinder
+            ring.Material = Enum.Material.Neon
+            ring.Color = (i % 2 == 0) and Color3.fromRGB(210, 248, 255) or CONFIG.BotColor
+            ring.Transparency = 0.15
+            ring.Size = Vector3.new(0.3, 2, 2)
+            ring.Anchored, ring.CanCollide, ring.CanTouch, ring.CanQuery, ring.CastShadow = true, false, false, false, false
+            ring.CFrame = CFrame.new(ground + Vector3.new(0, 0.2, 0)) * rot
+            ring.Parent = workspace
+            local d = 40 + i * 16
+            TweenService:Create(ring, TweenInfo.new(0.7 + i * 0.1, Enum.EasingStyle.Quad, Enum.EasingDirection.Out),
+                {Size = Vector3.new(0.12, d, d), Transparency = 1}):Play()
+            Debris:AddItem(ring, 1.3)
+        end)
+    end
+    fxFlash(ground + Vector3.new(0, 2, 0), 1.5, 15, Color3.fromRGB(210, 248, 255), 0.35, 8, 26)
+    for _ = 1, 16 do
+        local s = newFxPart("PrimeDoubleSpark", Vector3.new(0.12, 0.12, 0.12),
+            Color3.fromRGB(210, 248, 255), Enum.Material.Neon, 0, nil)
+        s.Shape = Enum.PartType.Ball
+        s.Anchored = true
+        s.CFrame = CFrame.new(ground + Vector3.new(0, 1.5, 0))
+        s.Parent = workspace
+        local a = math.random() * math.pi * 2
+        local dist = 4 + math.random() * 9
+        TweenService:Create(s, TweenInfo.new(0.5, Enum.EasingStyle.Quad, Enum.EasingDirection.Out),
+            {CFrame = CFrame.new(ground + Vector3.new(math.cos(a) * dist, 0.4, math.sin(a) * dist)), Transparency = 1}):Play()
+        Debris:AddItem(s, 0.6)
+    end
+end
+
+local function behindPose(vr, rigOff)
+    local look = vr.CFrame.LookVector
+    look = Vector3.new(look.X, 0, look.Z)
+    if look.Magnitude < 0.05 then look = Vector3.new(0, 0, -1) end
+    look = look.Unit
+    local behind = vr.Position - look * 2.2
+    local gp = groundAt(behind)
+    local y = gp.Y + rigOff
+    return CFrame.lookAt(Vector3.new(behind.X, y, behind.Z), Vector3.new(vr.Position.X, y, vr.Position.Z))
+end
+
+activateDouble = function()
+    -- ФИКС "не могу прыгать при спавне клона":
+    -- 1) если сидел на дроне — слезаем cleanly
+    if _G.__npDroneMounted and _G.__npDroneDismount then
+        _G.__npDroneDismount()
+        task.wait(0.1)
+    end
+    -- 2) чистим тело от ЛЮБЫХ констрейнтов и зажатых стейтов
+    if _G.__npPlayerFree then _G.__npPlayerFree() end
+
+    local myChar = LocalPlayer.Character
+    local myHum = myChar and myChar:FindFirstChildOfClass("Humanoid")
+    local myRoot = myChar and myChar:FindFirstChild("HumanoidRootPart")
+    if not (myChar and myHum and myRoot) or myHum.Health <= 0 then
+        setStatus("ДВОЙНИК: НЕТ ТЕЛА")
+        return
+    end
+    local session = doubleSession
+
+    if doubleState == "SWAPPED" then
+        if savedMyCF and myRoot.Parent then
+            myRoot.CFrame = savedMyCF + Vector3.new(0, 0.5, 0)
+            fxFlash(myRoot.Position, 0.6, 5, Color3.fromRGB(210, 248, 255), 0.3, 6, 14)
+            playSoundAt(myRoot, CONFIG.HoloDodgeSoundId, 1, 1.3, false)
+        end
+        endDoubleSession("ДВОЙНИК: ВОЗВРАТ // СЕССИЯ ЗАВЕРШЕНА")
+        return
+    end
+
+    if doubleState == "HUNTING" then
+        if not (doubleVictim and doubleVictim.Parent) then
+            endDoubleSession("ДВОЙНИК: ОТЗЫВАН")
+            return
+        end
+        local vRoot = doubleVictim:FindFirstChild("HumanoidRootPart")
+        local vHum = doubleVictim:FindFirstChildOfClass("Humanoid")
+        if not vRoot or not vHum or vHum.Health <= 0 then
+            endDoubleSession("ДВОЙНИК: ЖЕРТВА ПРОПАЛА")
+            return
+        end
+
+        savedMyCF = myRoot.CFrame
+        cleanupClone(true)
+
+        myRoot.CFrame = vRoot.CFrame * CFrame.new(0, 0, 2.4)
+        fxFlash(myRoot.Position, 0.6, 5, Color3.fromRGB(210, 248, 255), 0.3, 6, 14)
+        playSoundAt(myRoot, CONFIG.HoloDodgeSoundId, 1, 1.3, false)
+        doubleState = "SWAPPED"
+        setStatus("ДВОЙНИК: ТЫ ЗА СПИНОЙ " .. doubleVictim.Name)
+
+        chokeConn = RunService.Heartbeat:Connect(function()
+            if session ~= doubleSession then return end
+            local ch = LocalPlayer.Character
+            local r = ch and ch:FindFirstChild("HumanoidRootPart")
+            local mh = ch and ch:FindFirstChildOfClass("Humanoid")
+            if not (r and mh) or mh.Health <= 0 then
+                endDoubleSession("ДВОЙНИК: ТЫ ПОГИБ // СБРОС")
+                return
+            end
+            local vch = doubleVictim
+            local vr = vch and vch:FindFirstChild("HumanoidRootPart")
+            local vh = vch and vch:FindFirstChildOfClass("Humanoid")
+            if not (vr and vh) or vh.Health <= 0 or not vch.Parent then
+                endDoubleSession("ДВОЙНИК: ЖЕРТВА МЕРТВА // ОТПУСТИЛО")
+                return
+            end
+            r.CFrame = vRoot.CFrame * CFrame.new(0, 0, 2.4)
+            r.AssemblyLinearVelocity = vRoot.AssemblyLinearVelocity
+            r.AssemblyAngularVelocity = Vector3.zero
+            if math.random() < 0.25 then
+                local neckPos = (vr.CFrame * CFrame.new(0, 1.4, 0)).Position
+                fxFlash(neckPos, 0.15, 0.9, Color3.fromRGB(255, 60, 80), 0.22, 0, 0)
+            end
+        end)
+        return
+    end
+
+    doubleState = "HUNTING"
+    playSoundAt(myRoot, CONFIG.BombTickId, 1.2, 1.6, false)
+    playSoundAt(myRoot, CONFIG.HoloDodgeSoundId, 1, 1, false)
+    doubleWave(myRoot.Position)
+    setStatus("ДВОЙНИК: ЩЕЛЧОК // ПОЯВЛЯЕТСЯ РЯДОМ")
+
+    local clone, rootPart = buildDoubleClone(myChar)
+    cloneModel, cloneRoot = clone, rootPart
+    cloneHum = clone:FindFirstChildOfClass("Humanoid")
+
+    local fwd = myRoot.CFrame.LookVector
+    fwd = Vector3.new(fwd.X, 0, fwd.Z)
+    if fwd.Magnitude < 0.05 then fwd = Vector3.new(0, 0, -1) end
+    fwd = fwd.Unit
+    local sideDir = Vector3.new(-fwd.Z, 0, fwd.X)
+    local nearPos = myRoot.Position + fwd * 4 + sideDir * 2
+    local groundPos = groundAt(nearPos)
+
+    if rootPart then
+        rootPart.Anchored = true
+        rootPart.CFrame = CFrame.lookAt(groundPos + Vector3.new(0, 3, 0), myRoot.Position)
+    end
+    clone.Parent = workspace
+
+    local rigOff = measureRigOffset(clone, rootPart, cloneHum)
+
+    if cloneHum then
+        cloneDiedConn = cloneHum.Died:Connect(function()
+            if session == doubleSession then
+                endDoubleSession("ДВОЙНИК: УНИЧТОЖЕН // СБРОС")
+            end
+        end)
+    end
+
+    local walking = false
+    local lastMoveTo = 0
+
+    materializeClone(rootPart, cloneHum, groundPos, rigOff, function()
+        if session ~= doubleSession or doubleState ~= "HUNTING" then return end
+        walking = true
+        loadWalkAnim()
+        if cloneHum then
+            pcall(function() cloneHum:MoveTo(rootPart.Position) end)
+        end
+        setStatus("ДВОЙНИК: ОЖИВ // ИДЁТ К ЖЕРТВЕ")
+    end)
+
+    cloneConn = RunService.Heartbeat:Connect(function()
+        if session ~= doubleSession then return end
+        if doubleState ~= "HUNTING" then return end
+        local ch = LocalPlayer.Character
+        local myR = ch and ch:FindFirstChild("HumanoidRootPart")
+        local mh = ch and ch:FindFirstChildOfClass("Humanoid")
+        if not myR or not mh or mh.Health <= 0 then
+            endDoubleSession("ДВОЙНИК: ТЫ ПОГИБ // СБРОС")
+            return
+        end
+        if not (cloneModel and cloneModel.Parent) or not (cloneRoot and cloneRoot.Parent) or not cloneHum then
+            endDoubleSession("ДВОЙНИК: РАЗРУШЕН")
+            return
+        end
+        if not walking then return end
+
+        local now = os.clock()
+
+        local target, tdist = nil, math.huge
+        for _, pl in ipairs(Players:GetPlayers()) do
+            if pl ~= LocalPlayer then
+                local m = pl.Character
+                local h = m and m:FindFirstChildOfClass("Humanoid")
+                local r = m and m:FindFirstChild("HumanoidRootPart")
+                if m and r and h and h.Health > 0 and m.Name ~= "NanoShatterPieces" then
+                    local dist = (r.Position - cloneRoot.Position).Magnitude
+                    if dist < tdist then target, tdist = m, dist end
+                end
+            end
+        end
+
+        local targetPos
+        if target and target:FindFirstChild("HumanoidRootPart") then
+            local tRoot = target.HumanoidRootPart
+            targetPos = tRoot.Position - tRoot.CFrame.LookVector * 2.4
+        else
+            local ang = now * 0.9
+            targetPos = myR.Position + Vector3.new(math.cos(ang) * 5, cloneRoot.Position.Y, math.sin(ang) * 5)
+            target = nil
+        end
+
+        local flat = Vector3.new(targetPos.X - cloneRoot.Position.X, 0, targetPos.Z - cloneRoot.Position.Z)
+        local dist = flat.Magnitude
+
+        if dist > 1.6 then
+            if now - lastMoveTo > 0.2 then
+                lastMoveTo = now
+                pcall(function() cloneHum:MoveTo(targetPos) end)
+            end
+            local speed = cloneRoot.AssemblyLinearVelocity.Magnitude
+            if speed > 2 then
+                playWalkAnim()
+            else
+                stopWalkAnim()
+            end
+        else
+            stopWalkAnim()
+            walking = false
+            pcall(function() cloneHum:MoveTo(cloneRoot.Position) end)
+            if cloneConn then cloneConn:Disconnect(); cloneConn = nil end
+
+            if target then
+                local vRoot0 = target:FindFirstChild("HumanoidRootPart")
+                if cloneRoot and vRoot0 then
+                    cloneRoot.Anchored = true
+                    cloneRoot.CFrame = behindPose(vRoot0, rigOff)
+                end
+                doubleVictim = target
+                playSoundAt(cloneRoot, CONFIG.HoloDodgeSoundId, 0.8, 1.4, false)
+                setStatus("ДВОЙНИК: ЗА СПИНОЙ " .. target.Name .. " // ЖМИ ЕЩЁ РАЗ ЧТОБЫ ВСТАТЬ НА ЕГО МЕСТО")
+
+                chokeConn = RunService.Heartbeat:Connect(function()
+                    if session ~= doubleSession or doubleState ~= "HUNTING" then return end
+                    local vch = doubleVictim
+                    if not (vch and vch.Parent) then
+                        endDoubleSession("ДВОЙНИК: ЖЕРТВА ПРОПАЛА")
+                        return
+                    end
+                    local vr = vch:FindFirstChild("HumanoidRootPart")
+                    local vh = vch and vch:FindFirstChildOfClass("Humanoid")
+                    if not (vr and vh) or vh.Health <= 0 then
+                        endDoubleSession("ДВОЙНИК: ЖЕРТВА МЕРТВА // ЖМИ ЕЩЁ РАЗ")
+                        return
+                    end
+                    if cloneRoot and cloneRoot.Parent then
+                        cloneRoot.CFrame = behindPose(vr, rigOff)
+                    end
+                    if math.random() < 0.2 then
+                        local neckPos = (vr.CFrame * CFrame.new(0, 1.4, 0)).Position
+                        fxFlash(neckPos, 0.15, 0.9, Color3.fromRGB(255, 60, 80), 0.22, 0, 0)
+                    end
+                end)
+            else
+                if cloneRoot then
+                    cloneRoot.Anchored = true
+                    local gp = groundAt(cloneRoot.Position)
+                    cloneRoot.CFrame = CFrame.new(gp + Vector3.new(0, rigOff, 0))
+                        * (cloneRoot.CFrame - cloneRoot.CFrame.Position)
+                end
+                setStatus("ДВОЙНИК: ЖЕРТВ НЕТ // СТОИТ РЯДОМ")
+            end
+        end
+    end)
+end
+
+end -- конец блока двойника v4.5
 
 --========================= БЫСТРЫЙ РЕГЕН ГОЛОВЫ =========================
 do
@@ -5253,7 +5908,7 @@ end
 _G.__npQuickHeadPrint = quickHeadPrint
 end -- конец блока быстрого регена головы
 
---========================= КЛАВИШИ =========================
+--========================= КЛАВИШИ (+K АВАРИЯ) =========================
 track(UserInputService.InputBegan:Connect(function(input, gameProcessed)
     if gameProcessed then return end
     local kc = input.KeyCode
@@ -5285,6 +5940,16 @@ track(UserInputService.InputBegan:Connect(function(input, gameProcessed)
         if _G.__npDroneMounted and _G.__npDroneSpeedDown then
             safeCall("ДРОН-СКОР-", _G.__npDroneSpeedDown)
         end
+    elseif kc == Enum.KeyCode.K then
+        -- АВАРИЙНАЯ КНОПКА: снимает ВСЁ залипшее с тела
+        safeCall("АВАРИЯ", function()
+            if _G.__npDroneDismount and _G.__npDroneMounted then
+                _G.__npDroneDismount("АВАРИЯ [K] // ВСЁ СНЯТО")
+            elseif _G.__npPlayerFree then
+                _G.__npPlayerFree()
+                setStatus("АВАРИЯ [K] // ТЕЛО ОСВОБОЖДЕНО")
+            end
+        end)
     end
 end))
 
@@ -5312,6 +5977,10 @@ local function setupCharacter(character)
     local hum = character:WaitForChild("Humanoid", 10)
     if not hum then return end
     cancelAllPrints()
+
+    -- на новом теле не должно быть мусора от старой сессии
+    if _G.__npPlayerFree then _G.__npPlayerFree() end
+    _G.__npDroneMounted = false
 
     if pendingHeadDeath then headRegenPending = true end
 
@@ -5560,14 +6229,6 @@ end -- конец блока траектории
 
 --=====================================================================
 -- ПОРТАЛ v12.4 — модель rbxassetid://92778664168797 (БЕЗ ВРАЩЕНИЯ)
---  * Вход на земле перед игроком, ловит Бомбу Прайма по траектории
---  * ПЛАВНЫЙ засос по дуге (Безье), размер бомбы НЕ меняется
---  * Выходной портал НИ ЗА КЕМ НЕ ЛЕТАЕТ: спавнится над целью один раз,
---    выплёвывает бомбу и СРАЗУ закрывается
---  * Бомба выходит РОВНО ИЗ ЦЕНТРА портала ПОЛНОГО размера (fade-in),
---    ТА ЖЕ МОДЕЛЬ Бомбы Прайма (шар + обвеска + LED), чистое падение
---  * Фитиль 4 сек -> ГОТОВЫЙ ВЗРЫВ БОМБЫ РИКА ПРАЙМА
---    (bombBlast: флинг игроков + розовый кратер)
 --=====================================================================
 do
 local PORTAL_ID = 92778664168797
@@ -5621,9 +6282,6 @@ local function segDist(a, b, c)
     return (a + ab * t - c).Magnitude
 end
 
-----------------------------------------------------------------------
--- ЗАГРУЗКА МОДЕЛИ ПОРТАЛА (один раз, дальше только Clone)
-----------------------------------------------------------------------
 local function visibleBounds(root)
     local mn, mx
     local function add(p)
@@ -5761,9 +6419,6 @@ local function fitPortal(model, diameter)
     end)
 end
 
-----------------------------------------------------------------------
--- ЖИВОЙ ПОРТАЛ: плавное открытие, лёгкое парение, БЕЗ вращения
-----------------------------------------------------------------------
 local function createPortal(model, baseCF, diameter)
     local obj = {
         model = model,
@@ -5921,24 +6576,16 @@ local function exitCFrameAbove(pos)
     return CFrame.new(pos + Vector3.new(0, EXIT_HEIGHT, 0)) * CFrame.Angles(math.rad(-90), 0, 0)
 end
 
-----------------------------------------------------------------------
--- ДОСТАВКА v12.4: засос -> выходной портал над целью (НИЖЕ НЕ ЛЕТАЕТ),
--- выплёвывает бомбу и сразу закрывается. Бомба падает сама.
-----------------------------------------------------------------------
 local function deliverBomb(bomb, rec, vChar, session)
     local center = rec.center
     local startCF = bomb.CFrame
 
-    -- 1) пойманную бомбу просто убираем: её fuse-цикл в throwBomb сам
-    --    завершится без взрыва (бомба исчезла). Никаких клонов.
     bomb.Anchored = true
     bomb.CanCollide, bomb.CanTouch, bomb.CanQuery = false, false, false
     bomb:Destroy()
 
     if session ~= portalSession then return end
 
-    -- 2) рабочая бомба = ТА ЖЕ МОДЕЛЬ БОМБЫ ПРАЙМА (шар + гнёзда + LED).
-    --    Размер НЕ трогаем -> обвеска всегда на своём месте.
     local held
     if _G.__npBuildRickBomb then
         held = _G.__npBuildRickBomb(startCF.Position)
@@ -5952,7 +6599,6 @@ local function deliverBomb(bomb, rec, vChar, session)
     playSoundAt(held, CONFIG.HoloDodgeSoundId, 1.2, 1.3, false)
     fxFlash(held.Position, 0.4, 5, PORTAL_GREEN, 0.3, 4, 10)
 
-    -- 3) ПЛАВНЫЙ засос по дуге Безье, вращение затухает
     local portalNormal = rec.baseCF.LookVector
     local p0 = startCF.Position
     local p1 = center + portalNormal * 2.6
@@ -5971,7 +6617,6 @@ local function deliverBomb(bomb, rec, vChar, session)
     end
     if not held.Parent then return end
 
-    -- 4) растворение ТОЛЬКО прозрачностью (размер прежний)
     for _, d in ipairs(held:GetDescendants()) do
         if d:IsA("BasePart") then
             TweenService:Create(d, TweenInfo.new(0.22), {Transparency = 1}):Play()
@@ -5982,13 +6627,10 @@ local function deliverBomb(bomb, rec, vChar, session)
     fxFlash(center, 0.5, PORTAL_SIZE, PORTAL_GREEN, 0.3, 6, 14)
     held:Destroy()
 
-    -- 5) вход плавно закрывается
     closePortal(rec)
     task.wait(0.3)
     if session ~= portalSession then return end
 
-    -- 6) выходной портал: одна точка, НИ ЗА КЕМ НЕ СЛЕДИТ.
-    --    Позиция фиксируется в момент создания (где цель была).
     local vRoot = vChar and vChar.Parent and vChar:FindFirstChild("HumanoidRootPart")
     local vHum = vChar and vChar.Parent and vChar:FindFirstChildOfClass("Humanoid")
     local hasVictim = (vRoot and vHum and vHum.Health > 0) and true or false
@@ -6012,13 +6654,12 @@ local function deliverBomb(bomb, rec, vChar, session)
         setStatus("ПОРТАЛ: ЦЕЛЬ ПРОПАЛА // БОМБА ВЫПАДАЕТ ЗДЕСЬ")
     end
 
-    task.wait(0.55) -- выходной портал дофейдился
+    task.wait(0.55)
     if session ~= portalSession then
         closePortal(exitObj)
         return
     end
 
-    -- 7) бомба появляется В ЦЕНТРЕ портала, ПОЛНОГО размера, fade-in
     local bomb2
     if _G.__npBuildRickBomb then
         bomb2 = _G.__npBuildRickBomb(exitPos)
@@ -6039,13 +6680,10 @@ local function deliverBomb(bomb, rec, vChar, session)
     playSoundAt(bomb2, CONFIG.HoloDodgeSoundId, 1, 0.8, false)
     fxFlash(exitPos, 0.5, EXIT_SIZE, PORTAL_GREEN, 0.3, 6, 14)
 
-    -- 8) портал СВОЮ РАБОТУ СДЕЛАЛ — сразу закрывается и удаляется.
-    --    Бомба дальше сама, портал ни за кем не летает.
     task.delay(0.45, function()
         closePortal(exitObj)
     end)
 
-    -- 9) ЧИСТОЕ ПАДЕНИЕ: гравитация, без самонаведения
     bomb2.Anchored = false
     bomb2.CanCollide = true
     bomb2.CanTouch, bomb2.CanQuery = false, false
@@ -6053,7 +6691,6 @@ local function deliverBomb(bomb, rec, vChar, session)
     bomb2.AssemblyAngularVelocity = Vector3.new(
         math.random() * 3 - 1.5, math.random() * 3 - 1.5, math.random() * 3 - 1.5)
 
-    -- 10) ФИТИЛЬ: ровно 4 сек, бипы ускоряются, LED мигает
     local led = bomb2:FindFirstChild("PrimeBombLED")
     local ledLight = led and led:FindFirstChildOfClass("PointLight")
     local tickSound = Instance.new("Sound")
@@ -6088,7 +6725,7 @@ local function deliverBomb(bomb, rec, vChar, session)
         lastPos = bomb2.Position
         local fh = workspace.FallenPartsDestroyHeight
         if fh == fh and lastPos.Y < fh + 15 then
-            bomb2.Anchored = true -- не даём упасть в бездну до взрыва
+            bomb2.Anchored = true
         end
         task.wait()
     end
@@ -6101,7 +6738,6 @@ local function deliverBomb(bomb, rec, vChar, session)
     local boomPos = bomb2.Parent and bomb2.Position or lastPos
     pcall(function() bomb2:Destroy() end)
 
-    -- 11) ГОТОВЫЙ ВЗРЫВ БОМБЫ РИКА ПРАЙМА: флинг игроков + розовый кратер
     local bb = _G.__npBombBlast
     if bb then
         local okb, err = pcall(bb, boomPos)
@@ -6121,7 +6757,6 @@ local function closePicker()
     end
 end
 
--- ловушка: пока вход открыт, ищем PrimeBombBody по траектории
 local function startCatching(rec, session)
     local conn
     conn = RunService.Heartbeat:Connect(function()
@@ -6858,7 +7493,7 @@ do
     droneBtn = makeButton("ВЫЗВАТЬ / УБРАТЬ ДРОНА", function()
         giveDrone()
     end, parent)
-    makeButton("СЕСТЬ В КАБИНУ / ВЫЛЕЗТИ", function()
+    makeButton("ВСТАТЬ НА ДРОН / СЛЕЗТЬ", function()
         droneMountToggle()
     end, parent)
 
@@ -6879,7 +7514,7 @@ footer.BackgroundTransparency = 1
 footer.Font = Enum.Font.Code
 footer.TextSize = 8
 footer.TextColor3 = COLOR_NEON_DIM
-footer.Text = "v8.3 // V-ПИСТ G-БОМБА H-ГОЛОВА T-ДВОЙНИК Q-ГОЛО // ПОРТАЛ/ПИЛА/ДРОН — ЗДЕСЬ"
+footer.Text = "v8.3 // K-АВАРИЯ СЛЕЗАЕТ СО ВСЕГО // V G H T Q // ПОРТАЛ/ПИЛА/ДРОН — ЗДЕСЬ"
 footer.Parent = root
 footer.LayoutOrder = 5
 
