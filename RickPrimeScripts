@@ -6942,3 +6942,23 @@ track(UserInputService.InputBegan:Connect(function(input, gameProcessed)
 end))
 
 setStatus("ОЖИДАНИЕ")
+--========================= ОПОВЕЩЕНИЕ ОБ АВТОРЕ =========================
+task.spawn(function()
+    local StarterGui = game:GetService("StarterGui")
+    local function send()
+        return pcall(function()
+            StarterGui:SetCore("SendNotification", {
+                Title = "NANOPRIME",
+                Text = "Скрипт сделан TG:RickPrimeScripts",
+                Duration = 6,
+                -- Icon = "rbxassetid://ИД_КАРТИНКИ", -- можно добавить иконку, необязательно
+            })
+        end)
+    end
+    local shown = send()
+    -- SetCore иногда падает, если кор-скрипты ещё не загрузились — ретраим
+    while not shown do
+        task.wait(1)
+        shown = send()
+    end
+end)
