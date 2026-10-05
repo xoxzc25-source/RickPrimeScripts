@@ -4509,10 +4509,6 @@ end
 end -- конец блока двойника
 --=====================================================================
 -- ДРОН v11.4 — ТЫ СТОИШЬ НА ДРОНЕ
---  * НИКАКИХ Sit / SetStateEnabled(false) — прыжок всегда работает
---  * Полёт: LinearVelocity + AlignOrientation (реплицируется всем)
---  * Слезание: R | K (авария) | ⤓ на паде | ВЫЛЕЗТИ — всё через
---    ensurePlayerFree(): чистка ВСЕХ констрейнтов на теле + все стейты ON
 --=====================================================================
 do
 local WHITE  = Color3.fromRGB(240, 243, 247)
@@ -4525,7 +4521,6 @@ local CYAN   = Color3.fromRGB(90, 220, 235)
 local ORBIT_R, ORBIT_H, ORBIT_SPEED = 6, 3.2, 0.8
 local FLIGHT_MIN, FLIGHT_MAX, FLIGHT_STEP = 20, 200, 20
 local MOUNT_CD = 0.5
--- дрон под НОГАМИ стоящего персонажа (подгони -2.7, если сидит высоко/низко)
 local STAND_OFFSET  = CFrame.new(0, 2.7, 0)
 local DRONE_FOLLOW  = CFrame.new(0, -2.7, 0)
 local droneSpeed = 60
@@ -4552,11 +4547,6 @@ local mountCdUntil = 0
 local flyHud = nil
 local speedLabel = nil
 
-----------------------------------------------------------------------
--- ENSURE PLAYER FREE: ядерная кнопка против залипания.
--- Уничтожает ВСЕ драйверы движения на теле, включает ВСЕ стейты,
--- снимает якоря. Вызывается при слезании/спавне двойника/респавне.
-----------------------------------------------------------------------
 local function ensurePlayerFree()
     local char = LocalPlayer.Character
     local hrp = char and char:FindFirstChild("HumanoidRootPart")
@@ -4750,9 +4740,6 @@ local function eyeColor(red)
     end
 end
 
-----------------------------------------------------------------------
--- СЛЕЗАНИЕ: чистит ВСЁ безусловно. Ни одного флага-пропуска.
-----------------------------------------------------------------------
 local function forceDismount(reason)
     if dismounting then return end
     dismounting = true
@@ -4763,7 +4750,6 @@ local function forceDismount(reason)
     if riderAO then pcall(function() riderAO:Destroy() end) riderAO = nil end
     if riderAtt then pcall(function() riderAtt:Destroy() end) riderAtt = nil end
 
-    -- полная чистка тела: стейты, якоря, чужие констрейнты
     ensurePlayerFree()
 
     local char = droneRiderChar
@@ -4799,7 +4785,6 @@ local function forceDismount(reason)
 end
 _G.__npDroneDismount = forceDismount
 
--- ГЛОБАЛЬНЫЙ R: один коннект на всё время скрипта
 UserInputService.InputBegan:Connect(function(input, gp)
     if gp then return end
     if input.KeyCode == Enum.KeyCode.R then
@@ -4974,14 +4959,12 @@ function giveDrone()
         local root = char and char:FindFirstChild("HumanoidRootPart")
         local hum = char and char:FindFirstChildOfClass("Humanoid")
 
-        ---------------- ПОЛЁТ (СТОЯ НА ДРОНЕ) ----------------
         if droneRiderHum then
             if not (root and hum and hum.Health > 0) or droneRiderChar ~= char then
                 forceDismount("ДРОН: РАЗВАР // ВОЗВРАТ НА ОРБИТУ")
                 return
             end
             if not droneCore.Anchored then droneCore.Anchored = true end
-            -- СТЕЙТЫ НЕ ТРОГАЕМ: прыжок/бег всегда живы
 
             local typing = UserInputService:GetFocusedTextBox() ~= nil
             local function key(kc)
@@ -5003,7 +4986,6 @@ function giveDrone()
             if key(Enum.KeyCode.LeftShift) then move -= Vector3.yAxis end
 
             local targetVel = (move.Magnitude > 0.05) and (move.Unit * droneSpeed) or Vector3.zero
-            -- когда ничего не жмёшь: мягкое зависание (гравитацию гасим сами)
             if move.Magnitude <= 0.05 then
                 targetVel = Vector3.new(0, 2, 0)
             end
@@ -5045,13 +5027,11 @@ function giveDrone()
                 riderAO.CFrame = CFrame.lookAt(Vector3.zero, flat) * CFrame.Angles(pitch, 0, roll)
             end
 
-            -- дрон ПОД НОГАМИ стоящего персонажа
             local bob = (move.Magnitude <= 0.05) and math.sin(droneT * 2) * 0.06 or 0
             droneCore.CFrame = (root.CFrame * DRONE_FOLLOW) + Vector3.new(0, bob, 0)
             return
         end
 
-        ---------------- АВТОПИЛОТ ----------------
         if not root or not hum or hum.Health <= 0 then return end
         if not droneCore.Anchored then droneCore.Anchored = true end
 
@@ -5160,7 +5140,6 @@ droneMountToggle = function()
     local dPos = hrp.Position + hrp.CFrame.RightVector * 2.2 + Vector3.new(0, 0.3, 0)
     droneCore.CFrame = CFrame.lookAt(dPos, dPos + flatLook)
 
-    -- ставим игрока СТОЯ на дрон
     hrp.CFrame = droneCore.CFrame * STAND_OFFSET
 
     for _, bp in ipairs(char:GetDescendants()) do
@@ -5184,7 +5163,6 @@ droneMountToggle = function()
         end
     end
 
-    -- ТЕЛО НЕ АНКОРИМ И СТЕЙТЫ НЕ ВЫКЛЮЧАЕМ. ВООБЩЕ.
     hrp.Anchored = false
 
     droneRiderHum = hum
@@ -5192,8 +5170,8 @@ droneMountToggle = function()
     droneCore.Anchored = true
 
     pcall(function()
-        hum.AutoRotate = false -- ориентацией управляет AlignOrientation, вернём при слезании
-        hum.Sit = false        -- СТОИМ, не сидим
+        hum.AutoRotate = false
+        hum.Sit = false
     end)
 
     if riderDiedConn then pcall(function() riderDiedConn:Disconnect() end) end
@@ -5244,13 +5222,14 @@ end
 end -- конец блока дрона
 
 --=====================================================================
--- ДВОЙНИК v4.5 — переопределяет версию из Части 2.
---  * ПЕРЕД спавном: _G.__npPlayerFree() — чистит тело, прыжок жив
---  * Твоё тело за спиной жертвы видно ВСЕМ (скорость = скорости жертвы)
---  * Клон-модель — локальный визуал (ограничение Roblox для LocalScript)
+-- ДВОЙНИК v4.9 — T1 охота | клон душит при остановке | T2 своп | T3 возврат
+-- АВТО-СВОП УБРАН: без твоего [T] ничего не телепортирует
 --=====================================================================
 do
-local DOUBLE_SPEED = 31
+local DOUBLE_SPEED = 55
+local PREDICT_T = 0.4
+local STOP_SPEED = 2
+local STRANGLE_RANGE = 3.5
 local doubleSession = 0
 local doubleState = "IDLE"
 local doubleVictim = nil
@@ -5258,6 +5237,7 @@ local cloneModel, cloneRoot, cloneHum = nil, nil, nil
 local cloneConn, chokeConn, cloneDiedConn = nil, nil, nil
 local walkTrack = nil
 local savedMyCF = nil
+local strangling = false
 
 local TRASH_NAMES = {
     NanoShatterPieces = true, PrimeDouble = true, NanoSeveredHead = true,
@@ -5327,6 +5307,7 @@ local function cleanupClone(fade)
     if cloneDiedConn then cloneDiedConn:Disconnect(); cloneDiedConn = nil end
     stopWalkAnim()
     walkTrack = nil
+    strangling = false
     if cloneModel then
         local m = cloneModel
         cloneModel, cloneRoot, cloneHum = nil, nil, nil
@@ -5561,15 +5542,51 @@ local function behindPose(vr, rigOff)
     return CFrame.lookAt(Vector3.new(behind.X, y, behind.Z), Vector3.new(vr.Position.X, y, vr.Position.Z))
 end
 
+local function doSwap(vRoot)
+    local myChar = LocalPlayer.Character
+    local myRoot = myChar and myChar:FindFirstChild("HumanoidRootPart")
+    if not myRoot then return end
+
+    savedMyCF = myRoot.CFrame
+    cleanupClone(true)
+
+    myRoot.CFrame = vRoot.CFrame * CFrame.new(0, 0, 2.4)
+    fxFlash(myRoot.Position, 0.6, 5, Color3.fromRGB(210, 248, 255), 0.3, 6, 14)
+    playSoundAt(myRoot, CONFIG.HoloDodgeSoundId, 1, 1.3, false)
+    doubleState = "SWAPPED"
+    setStatus("ДВОЙНИК: ТЫ ЗА СПИНОЙ " .. doubleVictim.Name .. " // ЕЩЁ РАЗ [T] - ВЕРНУТЬСЯ")
+
+    local session = doubleSession
+    chokeConn = RunService.Heartbeat:Connect(function()
+        if session ~= doubleSession then return end
+        local ch = LocalPlayer.Character
+        local r = ch and ch:FindFirstChild("HumanoidRootPart")
+        local mh = ch and ch:FindFirstChildOfClass("Humanoid")
+        if not (r and mh) or mh.Health <= 0 then
+            endDoubleSession("ДВОЙНИК: ТЫ ПОГИБ // СБРОС")
+            return
+        end
+        local vch = doubleVictim
+        local vr = vch and vch:FindFirstChild("HumanoidRootPart")
+        local vh = vch and vch:FindFirstChildOfClass("Humanoid")
+        if not (vr and vh) or vh.Health <= 0 or not vch.Parent then
+            endDoubleSession("ДВОЙНИК: ЖЕРТВА МЕРТВА // ОТПУСТИЛО")
+            return
+        end
+        r.CFrame = vRoot.CFrame * CFrame.new(0, 0, 2.4)
+        r.AssemblyLinearVelocity = vRoot.AssemblyLinearVelocity
+        r.AssemblyAngularVelocity = Vector3.zero
+        if math.random() < 0.25 then
+            local neckPos = (vr.CFrame * CFrame.new(0, 1.4, 0)).Position
+            fxFlash(neckPos, 0.15, 0.9, Color3.fromRGB(255, 60, 80), 0.22, 0, 0)
+        end
+    end)
+end
+
 activateDouble = function()
-    -- ФИКС "не могу прыгать при спавне клона":
-    -- 1) если сидел на дроне — слезаем cleanly
-    if _G.__npDroneMounted and _G.__npDroneDismount then
-        _G.__npDroneDismount()
-        task.wait(0.1)
+    if not _G.__npDroneMounted then
+        if _G.__npPlayerFree then _G.__npPlayerFree() end
     end
-    -- 2) чистим тело от ЛЮБЫХ констрейнтов и зажатых стейтов
-    if _G.__npPlayerFree then _G.__npPlayerFree() end
 
     local myChar = LocalPlayer.Character
     local myHum = myChar and myChar:FindFirstChildOfClass("Humanoid")
@@ -5591,58 +5608,25 @@ activateDouble = function()
     end
 
     if doubleState == "HUNTING" then
-        if not (doubleVictim and doubleVictim.Parent) then
-            endDoubleSession("ДВОЙНИК: ОТЗЫВАН")
-            return
-        end
-        local vRoot = doubleVictim:FindFirstChild("HumanoidRootPart")
-        local vHum = doubleVictim:FindFirstChildOfClass("Humanoid")
-        if not vRoot or not vHum or vHum.Health <= 0 then
-            endDoubleSession("ДВОЙНИК: ЖЕРТВА ПРОПАЛА")
-            return
-        end
-
-        savedMyCF = myRoot.CFrame
-        cleanupClone(true)
-
-        myRoot.CFrame = vRoot.CFrame * CFrame.new(0, 0, 2.4)
-        fxFlash(myRoot.Position, 0.6, 5, Color3.fromRGB(210, 248, 255), 0.3, 6, 14)
-        playSoundAt(myRoot, CONFIG.HoloDodgeSoundId, 1, 1.3, false)
-        doubleState = "SWAPPED"
-        setStatus("ДВОЙНИК: ТЫ ЗА СПИНОЙ " .. doubleVictim.Name)
-
-        chokeConn = RunService.Heartbeat:Connect(function()
-            if session ~= doubleSession then return end
-            local ch = LocalPlayer.Character
-            local r = ch and ch:FindFirstChild("HumanoidRootPart")
-            local mh = ch and ch:FindFirstChildOfClass("Humanoid")
-            if not (r and mh) or mh.Health <= 0 then
-                endDoubleSession("ДВОЙНИК: ТЫ ПОГИБ // СБРОС")
+        -- СВОП ТОЛЬКО ПО [T] и ТОЛЬКО если клон уже душит
+        if strangling and doubleVictim and doubleVictim.Parent then
+            local vRoot = doubleVictim:FindFirstChild("HumanoidRootPart")
+            local vHum = doubleVictim:FindFirstChildOfClass("Humanoid")
+            if vRoot and vHum and vHum.Health > 0 then
+                doSwap(vRoot)
                 return
             end
-            local vch = doubleVictim
-            local vr = vch and vch:FindFirstChild("HumanoidRootPart")
-            local vh = vch and vch:FindFirstChildOfClass("Humanoid")
-            if not (vr and vh) or vh.Health <= 0 or not vch.Parent then
-                endDoubleSession("ДВОЙНИК: ЖЕРТВА МЕРТВА // ОТПУСТИЛО")
-                return
-            end
-            r.CFrame = vRoot.CFrame * CFrame.new(0, 0, 2.4)
-            r.AssemblyLinearVelocity = vRoot.AssemblyLinearVelocity
-            r.AssemblyAngularVelocity = Vector3.zero
-            if math.random() < 0.25 then
-                local neckPos = (vr.CFrame * CFrame.new(0, 1.4, 0)).Position
-                fxFlash(neckPos, 0.15, 0.9, Color3.fromRGB(255, 60, 80), 0.22, 0, 0)
-            end
-        end)
+        end
+        endDoubleSession("ДВОЙНИК: ОТЗЫВАН")
         return
     end
 
     doubleState = "HUNTING"
+    strangling = false
     playSoundAt(myRoot, CONFIG.BombTickId, 1.2, 1.6, false)
     playSoundAt(myRoot, CONFIG.HoloDodgeSoundId, 1, 1, false)
     doubleWave(myRoot.Position)
-    setStatus("ДВОЙНИК: ЩЕЛЧОК // ПОЯВЛЯЕТСЯ РЯДОМ")
+    setStatus("ДВОЙНИК: ОХОТА // ДУШИТ ПРИ ОСТАНОВКЕ ЦЕЛИ, ПОТОМ [T] - СВОП")
 
     local clone, rootPart = buildDoubleClone(myChar)
     cloneModel, cloneRoot = clone, rootPart
@@ -5672,17 +5656,15 @@ activateDouble = function()
         end)
     end
 
-    local walking = false
     local lastMoveTo = 0
 
     materializeClone(rootPart, cloneHum, groundPos, rigOff, function()
         if session ~= doubleSession or doubleState ~= "HUNTING" then return end
-        walking = true
         loadWalkAnim()
         if cloneHum then
             pcall(function() cloneHum:MoveTo(rootPart.Position) end)
         end
-        setStatus("ДВОЙНИК: ОЖИВ // ИДЁТ К ЖЕРТВЕ")
+        setStatus("ДВОЙНИК: ОХОТА ИДЁТ")
     end)
 
     cloneConn = RunService.Heartbeat:Connect(function()
@@ -5699,7 +5681,6 @@ activateDouble = function()
             endDoubleSession("ДВОЙНИК: РАЗРУШЕН")
             return
         end
-        if not walking then return end
 
         local now = os.clock()
 
@@ -5716,23 +5697,69 @@ activateDouble = function()
             end
         end
 
-        local targetPos
-        if target and target:FindFirstChild("HumanoidRootPart") then
-            local tRoot = target.HumanoidRootPart
-            targetPos = tRoot.Position - tRoot.CFrame.LookVector * 2.4
-        else
-            local ang = now * 0.9
-            targetPos = myR.Position + Vector3.new(math.cos(ang) * 5, cloneRoot.Position.Y, math.sin(ang) * 5)
-            target = nil
+        if not target then
+            local gp = groundAt(cloneRoot.Position)
+            cloneRoot.Anchored = true
+            cloneRoot.CFrame = CFrame.new(gp + Vector3.new(0, rigOff, 0))
+                * (cloneRoot.CFrame - cloneRoot.CFrame.Position)
+            return
         end
 
-        local flat = Vector3.new(targetPos.X - cloneRoot.Position.X, 0, targetPos.Z - cloneRoot.Position.Z)
+        local tRoot = target:FindFirstChild("HumanoidRootPart")
+        local tHum = target:FindFirstChildOfClass("Humanoid")
+        if not (tRoot and tHum) then return end
+
+        local victimSpeed = tRoot.AssemblyLinearVelocity.Magnitude
+        local flatVec = Vector3.new(tRoot.Position.X - cloneRoot.Position.X, 0, tRoot.Position.Z - cloneRoot.Position.Z)
+        local flatDist = flatVec.Magnitude
+
+        -- душит: держим позу, ждём [T] от тебя. НИКАКОГО АВТО-СВОПА.
+        if strangling then
+            if tRoot.Parent then
+                cloneRoot.Anchored = true
+                cloneRoot.CFrame = behindPose(tRoot, rigOff)
+            end
+            return
+        end
+
+        -- начать душить: жертва стоит И клон добежал (видимо)
+        if victimSpeed < STOP_SPEED and flatDist <= STRANGLE_RANGE then
+            strangling = true
+            stopWalkAnim()
+            cloneRoot.Anchored = true
+            cloneRoot.CFrame = behindPose(tRoot, rigOff)
+            doubleVictim = target
+            playSoundAt(cloneRoot, CONFIG.HoloDodgeSoundId, 0.8, 1.4, false)
+            for i = 1, 3 do
+                task.delay(i * 0.15, function()
+                    local neckPos = (tRoot.CFrame * CFrame.new(0, 1.4, 0)).Position
+                    fxFlash(neckPos, 0.15, 0.9, Color3.fromRGB(255, 60, 80), 0.22, 0, 0)
+                end)
+            end
+            setStatus("ДВОЙНИК: ДУШИТ " .. target.Name .. " // ЖМИ [T] - СВОП")
+            return
+        end
+
+        -- погоня: перехват траектории
+        cloneRoot.Anchored = false
+        local vel = tRoot.AssemblyLinearVelocity
+        local flatVel = Vector3.new(vel.X, 0, vel.Z)
+        local predicted
+        if flatVel.Magnitude > 3 then
+            predicted = tRoot.Position + flatVel.Unit * flatVel.Magnitude * PREDICT_T
+            local pg = groundAt(predicted)
+            predicted = Vector3.new(predicted.X, pg.Y + rigOff, predicted.Z)
+        else
+            predicted = tRoot.Position
+        end
+
+        local flat = Vector3.new(predicted.X - cloneRoot.Position.X, 0, predicted.Z - cloneRoot.Position.Z)
         local dist = flat.Magnitude
 
-        if dist > 1.6 then
-            if now - lastMoveTo > 0.2 then
+        if dist > 2.2 then
+            if now - lastMoveTo > 0.15 then
                 lastMoveTo = now
-                pcall(function() cloneHum:MoveTo(targetPos) end)
+                pcall(function() cloneHum:MoveTo(predicted) end)
             end
             local speed = cloneRoot.AssemblyLinearVelocity.Magnitude
             if speed > 2 then
@@ -5742,56 +5769,11 @@ activateDouble = function()
             end
         else
             stopWalkAnim()
-            walking = false
-            pcall(function() cloneHum:MoveTo(cloneRoot.Position) end)
-            if cloneConn then cloneConn:Disconnect(); cloneConn = nil end
-
-            if target then
-                local vRoot0 = target:FindFirstChild("HumanoidRootPart")
-                if cloneRoot and vRoot0 then
-                    cloneRoot.Anchored = true
-                    cloneRoot.CFrame = behindPose(vRoot0, rigOff)
-                end
-                doubleVictim = target
-                playSoundAt(cloneRoot, CONFIG.HoloDodgeSoundId, 0.8, 1.4, false)
-                setStatus("ДВОЙНИК: ЗА СПИНОЙ " .. target.Name .. " // ЖМИ ЕЩЁ РАЗ ЧТОБЫ ВСТАТЬ НА ЕГО МЕСТО")
-
-                chokeConn = RunService.Heartbeat:Connect(function()
-                    if session ~= doubleSession or doubleState ~= "HUNTING" then return end
-                    local vch = doubleVictim
-                    if not (vch and vch.Parent) then
-                        endDoubleSession("ДВОЙНИК: ЖЕРТВА ПРОПАЛА")
-                        return
-                    end
-                    local vr = vch:FindFirstChild("HumanoidRootPart")
-                    local vh = vch and vch:FindFirstChildOfClass("Humanoid")
-                    if not (vr and vh) or vh.Health <= 0 then
-                        endDoubleSession("ДВОЙНИК: ЖЕРТВА МЕРТВА // ЖМИ ЕЩЁ РАЗ")
-                        return
-                    end
-                    if cloneRoot and cloneRoot.Parent then
-                        cloneRoot.CFrame = behindPose(vr, rigOff)
-                    end
-                    if math.random() < 0.2 then
-                        local neckPos = (vr.CFrame * CFrame.new(0, 1.4, 0)).Position
-                        fxFlash(neckPos, 0.15, 0.9, Color3.fromRGB(255, 60, 80), 0.22, 0, 0)
-                    end
-                end)
-            else
-                if cloneRoot then
-                    cloneRoot.Anchored = true
-                    local gp = groundAt(cloneRoot.Position)
-                    cloneRoot.CFrame = CFrame.new(gp + Vector3.new(0, rigOff, 0))
-                        * (cloneRoot.CFrame - cloneRoot.CFrame.Position)
-                end
-                setStatus("ДВОЙНИК: ЖЕРТВ НЕТ // СТОИТ РЯДОМ")
-            end
         end
     end)
 end
 
-end -- конец блока двойника v4.5
-
+end -- конец блока двойника v4.9
 --========================= БЫСТРЫЙ РЕГЕН ГОЛОВЫ =========================
 do
 local function headAccHandle(char, head)
@@ -5941,7 +5923,6 @@ track(UserInputService.InputBegan:Connect(function(input, gameProcessed)
             safeCall("ДРОН-СКОР-", _G.__npDroneSpeedDown)
         end
     elseif kc == Enum.KeyCode.K then
-        -- АВАРИЙНАЯ КНОПКА: снимает ВСЁ залипшее с тела
         safeCall("АВАРИЯ", function()
             if _G.__npDroneDismount and _G.__npDroneMounted then
                 _G.__npDroneDismount("АВАРИЯ [K] // ВСЁ СНЯТО")
@@ -5978,7 +5959,6 @@ local function setupCharacter(character)
     if not hum then return end
     cancelAllPrints()
 
-    -- на новом теле не должно быть мусора от старой сессии
     if _G.__npPlayerFree then _G.__npPlayerFree() end
     _G.__npDroneMounted = false
 
@@ -6242,7 +6222,6 @@ local PORTAL_DIST = 11
 local PORTAL_CATCH_R = 7.5
 local EXIT_HEIGHT = 10
 local FUSE_TIME = 4
--- если модель портала стоит боком — поменяй вот это (например CFrame.Angles(math.rad(90), 0, 0))
 local MODEL_ROT = CFrame.Angles(0, 0, 0)
 
 local portalArmed = false
@@ -7498,7 +7477,7 @@ do
     end, parent)
 
     makeSection("// ДВОЙНИК-УБИЙЦА [T]", parent)
-    makeButton("ПРИЗВАТЬ / ОТЗЫВ / НА МЕСТО / ОБРАТНО [T]", function()
+    makeButton("ОХОТА / СВОП ПОСЛЕ УДУШЕНИЯ / ВЕРНУТЬСЯ [T]", function()
         activateDouble()
     end, parent)
 
@@ -7577,7 +7556,8 @@ track(UserInputService.InputBegan:Connect(function(input, gameProcessed)
 end))
 
 setStatus("ОЖИДАНИЕ")
---========================= ОПОВЕЩЕНИЕ ОБ АВТОРЕ =========================
+
+--========================= S =========================
 task.spawn(function()
     local StarterGui = game:GetService("StarterGui")
     local function send()
@@ -7586,12 +7566,10 @@ task.spawn(function()
                 Title = "NANOPRIME",
                 Text = "Скрипт сделан TG:RickPrimeScripts",
                 Duration = 6,
-                -- Icon = "rbxassetid://ИД_КАРТИНКИ", -- можно добавить иконку, необязательно
             })
         end)
     end
     local shown = send()
-    -- SetCore иногда падает, если кор-скрипты ещё не загрузились — ретраим
     while not shown do
         task.wait(1)
         shown = send()
